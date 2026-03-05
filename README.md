@@ -50,6 +50,8 @@ curl -X POST "https://poolup-routing-main-271904393612.us-central1.run.app/optim
   }'
 ```
 
+Optional: easily try out queries at: https://poolup-routing-main-271904393612.us-central1.run.app/docs#/default/optimize_endpoint_optimize_post
+
 ## Visualize the response
 
 After you receive the JSON response, you can visualize it by copying/pasting the response into:
