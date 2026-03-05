@@ -48,7 +48,9 @@ curl -X POST "https://poolup-routing-main-271904393612.us-central1.run.app/optim
       { "userId": "p2", "role": "PASSENGER", "pickup": { "lat": 33.7811, "lng": -84.3812 } }
     ]
   }'
-Visualize the response
+```
+
+## Visualize the response
 
 After you receive the JSON response, you can visualize it by copying/pasting the response into:
 
