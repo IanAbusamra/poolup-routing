@@ -150,7 +150,7 @@ def compute_routes(origin: LatLng, destination: LatLng, intermediates: List[LatL
             "routes.legs.steps.navigationInstruction.instructions",
             "routes.legs.steps.distanceMeters",
             "routes.legs.steps.staticDuration",
-            "routes.legs.steps.maneuver",
+            "routes.legs.steps.navigationInstruction.maneuver",
         ]),
     }
 
