@@ -4,6 +4,11 @@ This service computes an optimized carpool pickup order and returns route geomet
 
 It is currently deployed on Cloud Run and is publicly accessible.
 
+## Summary: 
+Very briefly: the routing algo is a brute-force assignment + local route ordering approach. It tries every passenger→driver assignment with itertools.product(...), filters out invalid ones by seats and mustRideWith / avoidRideWith, then for each driver in that candidate assignment it asks Google for a route matrix, tries every pickup permutation to find the cheapest stop order, keeps the best few candidates, and finally calls computeRoutes on the top refineTopK candidates to get the exact winning routes.  
+The main reason for the insane number of API calls is that compute_matrix(...) is called inside the brute-force loop. So for each feasible assignment, and for each driver in that assignment, it makes a fresh Google Route Matrix request; with up to bruteforceMaxEvaluations = 3000, that multiplies fast. The exact-route compute_routes(...) calls for the top candidates are secondary; the real explosion is the repeated matrix calls during search, especially since there’s no caching of repeated driver/pickup subsets.    
+A one-line summary: it’s brute force over assignments, and the expensive Google matrix request sits in the innermost search path.
+
 ---
 
 ## Base URL
