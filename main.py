@@ -24,7 +24,8 @@ DEFAULT_OPTIONS = {
     "bruteforceMaxEvaluations": 3000,
     "bruteforceMaxStopsPerDriver": 8,
     "polylineMaxPoints": 500,
-    "refineTopK": 3
+    # reduced from 3 -> 1 to trade a bit of accuracy for far fewer exact route calls
+    "refineTopK": 1,
 }
 
 
@@ -47,7 +48,6 @@ class Person(BaseModel):
     pickup: Optional[LatLng] = None
     seats: int = 0  # passenger seats (not counting driver)
 
-    # FIX: avoid shared mutable defaults
     mustRideWith: List[str] = Field(default_factory=list)
     avoidRideWith: List[str] = Field(default_factory=list)
 
@@ -138,13 +138,8 @@ def compute_routes(
     routing_pref: str,
     departure_time: Optional[str],
 ) -> Dict[str, Any]:
-    """
-    Calls computeRoutes and requests steps + polyline.
-    """
     require_key()
 
-    # FIX: request parent objects to avoid brittle field-mask expansion errors
-    # (still minimal enough, but stops the "cannot find matching fields" whack-a-mole).
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": MAPS_API_KEY,
@@ -154,7 +149,7 @@ def compute_routes(
             "routes.polyline.encodedPolyline",
             "routes.legs.duration",
             "routes.legs.distanceMeters",
-            "routes.legs.steps",  # <-- robust
+            "routes.legs.steps",
         ]),
     }
 
@@ -166,15 +161,12 @@ def compute_routes(
         "polylineEncoding": "ENCODED_POLYLINE",
     }
 
-    # FIX: routingPreference only valid for DRIVE or TWO_WHEELER
-    # otherwise computeRoutes can fail with INVALID_ARGUMENT.
     if travel_mode in ("DRIVE", "TWO_WHEELER") and routing_pref:
         body["routingPreference"] = routing_pref
 
     if intermediates:
         body["intermediates"] = [{"location": {"latLng": _latlng_obj(p)}} for p in intermediates]
 
-    # departureTime must be RFC3339; offsets are accepted. :contentReference[oaicite:5]{index=5}
     if departure_time:
         body["departureTime"] = departure_time
 
@@ -210,7 +202,6 @@ def compute_matrix(points: List[LatLng], travel_mode: str, routing_pref: str) ->
         return [json.loads(ln) for ln in lines]
 
 def dur_to_seconds(d: Any) -> int:
-    # duration strings like "3.5s" :contentReference[oaicite:6]{index=6}
     if isinstance(d, str) and d.endswith("s"):
         return int(float(d[:-1]))
     if isinstance(d, dict) and "seconds" in d:
@@ -227,7 +218,7 @@ def build_cost_lookup(matrix: List[Dict[str, Any]]) -> Dict[Tuple[int, int], int
 
 
 # =========================
-# Optimization (bruteforce with safety)
+# Optimization
 # =========================
 @dataclass
 class Driver:
@@ -262,6 +253,36 @@ def approx_route_duration(cost: Dict[Tuple[int, int], int], idx_order: List[int]
         total += cost.get((a, b), 10**9)
     return total
 
+def build_global_cost_data(
+    drivers: List[Driver],
+    passengers: List[Passenger],
+    destination: LatLng,
+    travel_mode: str,
+    routing_pref: str,
+) -> Tuple[Dict[Tuple[int, int], int], Dict[str, int], Dict[str, int], int]:
+    """
+    One matrix call per request.
+    """
+    points: List[LatLng] = []
+    driver_idx: Dict[str, int] = {}
+    pickup_idx: Dict[str, int] = {}
+
+    for d in drivers:
+        driver_idx[d.userId] = len(points)
+        points.append(d.start)
+
+    for p in passengers:
+        pickup_idx[p.userId] = len(points)
+        points.append(p.pickup)
+
+    dest_idx = len(points)
+    points.append(destination)
+
+    matrix = compute_matrix(points, travel_mode, routing_pref)
+    cost = build_cost_lookup(matrix)
+
+    return cost, driver_idx, pickup_idx, dest_idx
+
 def optimize(
     drivers: List[Driver],
     passengers: List[Passenger],
@@ -272,6 +293,10 @@ def optimize(
     max_evals: int,
     max_stops_per_driver: int,
     refine_top_k: int,
+    global_cost: Dict[Tuple[int, int], int],
+    driver_idx: Dict[str, int],
+    pickup_idx: Dict[str, int],
+    dest_idx: int,
 ) -> Dict[str, Any]:
     if len(passengers) > 10 or len(drivers) > 4:
         return {"fallback": True, "reason": "Too many passengers/drivers for brute force"}
@@ -297,8 +322,9 @@ def optimize(
         for pid, didx in zip(passenger_ids, choice):
             per_driver_pickups[drivers[didx].userId].append(pid)
 
+        # keep same intent, but do not abort the whole optimization on one bad candidate
         if any(len(per_driver_pickups[d.userId]) > max_stops_per_driver for d in drivers):
-            return {"fallback": True, "reason": "Too many stops per driver for brute force"}
+            continue
 
         approx_total = 0
         per_driver_best_order: Dict[str, List[str]] = {}
@@ -309,20 +335,16 @@ def optimize(
                 per_driver_best_order[d.userId] = []
                 continue
 
-            pts: List[LatLng] = [d.start] + [
-                next(p.pickup for p in passengers if p.userId == pid) for pid in pickups
-            ] + [destination]
-
-            matrix = compute_matrix(pts, travel_mode, routing_pref)
-            cost = build_cost_lookup(matrix)
-
-            pickup_indices = list(range(1, 1 + len(pickups)))
+            pickup_indices = list(range(len(pickups)))
             best_perm = None
             best_perm_cost = 10**18
 
             for perm in itertools.permutations(pickup_indices):
-                idx_order = [0] + list(perm) + [len(pts) - 1]
-                c = approx_route_duration(cost, idx_order)
+                idx_order = [driver_idx[d.userId]]
+                idx_order.extend(pickup_idx[pickups[i]] for i in perm)
+                idx_order.append(dest_idx)
+
+                c = approx_route_duration(global_cost, idx_order)
                 if c < best_perm_cost:
                     best_perm_cost = c
                     best_perm = perm
@@ -330,9 +352,9 @@ def optimize(
             approx_total += int(best_perm_cost)
 
             ordered: List[str] = []
-            if best_perm:
-                for idx in best_perm:
-                    ordered.append(pickups[idx - 1])
+            if best_perm is not None:
+                for i in best_perm:
+                    ordered.append(pickups[i])
             per_driver_best_order[d.userId] = ordered
 
         evals += 1
@@ -425,6 +447,15 @@ def optimize_endpoint(req: OptimizeRequest):
             "debug": {"evaluations": 0, "fallbackUsed": True, "reason": "No drivers"},
         }
 
+    # one shared matrix for the whole request
+    global_cost, driver_idx, pickup_idx, dest_idx = build_global_cost_data(
+        drivers=drivers,
+        passengers=passengers,
+        destination=req.event.destination,
+        travel_mode=travel_mode,
+        routing_pref=routing_pref,
+    )
+
     result = optimize(
         drivers=drivers,
         passengers=passengers,
@@ -435,9 +466,12 @@ def optimize_endpoint(req: OptimizeRequest):
         max_evals=max_evals,
         max_stops_per_driver=max_stops,
         refine_top_k=refine_k,
+        global_cost=global_cost,
+        driver_idx=driver_idx,
+        pickup_idx=pickup_idx,
+        dest_idx=dest_idx,
     )
 
-    # Helper to extract steps correctly
     def extract_steps(r0: Dict[str, Any]) -> List[Dict[str, Any]]:
         steps_out: List[Dict[str, Any]] = []
         for leg in r0.get("legs", []):
@@ -447,13 +481,11 @@ def optimize_endpoint(req: OptimizeRequest):
                     "instruction": ni.get("instructions"),
                     "maneuver": ni.get("maneuver"),
                     "distanceMeters": step.get("distanceMeters"),
-                    # FIX: step durations are staticDuration, not duration
                     "durationSeconds": dur_to_seconds(step["staticDuration"]) if step.get("staticDuration") else None,
                 })
         return steps_out
 
     if result.get("fallback"):
-        # Very simple fallback: round-robin assignment (kept from your original)
         unassigned = []
         plans = []
         seats_left = {d.userId: d.seats for d in drivers}
